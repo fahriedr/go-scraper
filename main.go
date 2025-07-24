@@ -2,44 +2,117 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/chromedp"
-	"golang.org/x/net/html"
+	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/mux"
 )
 
 type Product struct {
-	Title string
-	Link  string
-	Image string
-	Price string
+	Title  string  `json:"title"`
+	Link   string  `json:"link"`
+	Image  string  `json:"image"`
+	Price  string  `json:"price"`
+	Source *string `json:"source,omitempty"`
 }
+
+type Response struct {
+	Data    []Product `json:"data"`
+	Message string    `json:"message"`
+}
+
+var tokopediaURL = "https://www.tokopedia.com/search?st=product&q="
+
+var redisHost = "localhost:6379"
+var redisPassword = ""
 
 func main() {
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", false), // <- run with UI
-		chromedp.Flag("disable-gpu", false),
-		chromedp.Flag("enable-automation", false), // try to reduce detection
-	)
+	r := mux.NewRouter()
 
-	ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
+	r.HandleFunc("/products/{keyword}", getProducts).Methods("GET")
 
-	ctx, cancel = chromedp.NewContext(ctx)
-	defer cancel()
+	// Start server
+	fmt.Println("Server is running on http://localhost:5002")
+	log.Fatal(http.ListenAndServe(":5002", r))
+}
 
-	url := "https://www.tokopedia.com/search?q=ortuseight"
+func getProducts(w http.ResponseWriter, r *http.Request) {
+
+	var productList []Product
+
+	rdb := newRedisClient(redisHost, redisPassword)
+	fmt.Println("redis client initialized")
+
+	redisData, err := getRedisData(rdb, mux.Vars(r)["keyword"])
+
+	if err != nil {
+		log.Fatal(err)
+		fmt.Println(err.Error())
+	}
+
+	if redisData == "" {
+		fmt.Println("redis data not found, scraping...")
+		opts := append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.Flag("headless", false), // <- run with UI
+			chromedp.Flag("disable-gpu", false),
+			chromedp.Flag("enable-automation", false), // try to reduce detection
+		)
+
+		ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+		defer cancel()
+
+		ctx, cancel = chromedp.NewContext(ctx)
+		defer cancel()
+
+		productList, err = TokopediaScraper(w, r, ctx)
+
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		setRedisData(rdb, mux.Vars(r)["keyword"], productList)
+
+	} else {
+		fmt.Println("redis data found, using cached data")
+
+		err := json.Unmarshal([]byte(redisData), &productList)
+
+		if err != nil {
+			log.Fatal(err)
+			http.Error(w, "Failed to parse cached data", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	Response := Response{
+		Data:    productList,
+		Message: "Products retrieved successfully",
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Add("Content-Type", "Application/json")
+	json.NewEncoder(w).Encode(Response)
+
+}
+
+func TokopediaScraper(w http.ResponseWriter, r *http.Request, ctx context.Context) ([]Product, error) {
+	source := "Tokopedia"
+	keyword := mux.Vars(r)["keyword"]
+	url := fmt.Sprintf(tokopediaURL+"%s", keyword)
 
 	var htmlContent string
 
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(url),
-		chromedp.Sleep(3*time.Second), // wait for JavaScript to render
+		chromedp.Sleep(3*time.Second),
 		chromedp.OuterHTML("html", &htmlContent),
 	)
 	if err != nil {
@@ -53,92 +126,62 @@ func main() {
 		log.Fatal(err)
 	}
 
-	htmlData, _ := doc.Find("div.css-5wh65g").First().Html()
+	var products []Product
 
-	// Parse the HTML string
-	node, err := html.Parse(strings.NewReader(htmlData))
+	doc.Find("div.css-5wh65g").Each(func(index int, s *goquery.Selection) {
+
+		if index > 10 {
+			return
+		}
+
+		link, _ := s.Find("a").Attr("href")
+
+		products = append(products, Product{
+			Title:  s.Find(`span[class="+tnoqZhn89+NHUA43BpiJg=="]`).Text(),
+			Link:   link,
+			Image:  s.Find("img[alt='product-image']").AttrOr("src", ""),
+			Price:  s.Find(`div[class*="urMOIDHH7I0Iy1Dv2oFaNw"]`).Text(),
+			Source: &source,
+		})
+	})
+
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	// Find the span value
-	var name string
-	var price string
-
-	var f func(*html.Node)
-	f = func(n *html.Node) {
-		if n.Type == html.ElementNode {
-			// Get title
-			name = getName(n)
-
-			// Get price
-			price = getPrice(n)
-		}
-
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			f(c)
-		}
-	}
-
-	f(node)
-
-	fmt.Println("Title:", name)
-	fmt.Println("Price:", price)
-
-	// var products []Product
-
-	// doc.Find("div.css-5wh65g").Each(func(index int, s *goquery.Selection) {
-
-	// 	if index > 10 {
-	// 		return
-	// 	}
-
-	// 	link, _ := s.Find("a").Attr("href")
-
-	// 	products = append(products, Product{
-	// 		Title: s.Find("span").Text(),
-	// 		Link:  link,
-	// 		Image: s.Find("img[alt='product-image']").AttrOr("src", ""),
-	// 		Price: s.Find("div._67d6E1xDKIzw+i2D2L0tjw== t4jWW3NandT5hvCFAiotYg==").Text(),
-	// 	})
-	// })
-
-	// _, err = json.MarshalIndent(products, "", "  ")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	// fmt.Println(string(jsonBytes))
-
+	return products, nil
 }
 
-func getName(n *html.Node) string {
-	// Get title
-	if n.Data == "span" {
-		for _, attr := range n.Attr {
-			if attr.Key == "class" && attr.Val == "_0T8-iGxMpV6NEsYEhwkqEg==" {
-				if n.FirstChild != nil {
+func newRedisClient(host string, password string) *redis.Client {
+	client := redis.NewClient(&redis.Options{
+		Addr:     host,
+		Password: password,
+		DB:       0,
+	})
 
-					return n.FirstChild.Data
-				}
-			}
-		}
-	}
-
-	return ""
+	return client
 }
 
-func getPrice(n *html.Node) string {
-	// Get price
-	if n.Data == "div" {
-		for _, attr := range n.Attr {
-			if attr.Key == "class" && strings.Contains(attr.Val, "t4jWW3NandT5hvCFAiotYg==") {
-				if n.FirstChild != nil {
-					return n.FirstChild.Data
-				}
-			}
-		}
+func getRedisData(client *redis.Client, key string) (string, error) {
+	ctx := context.Background()
+	val, err := client.Get(ctx, key).Result()
+	if err == redis.Nil {
+		return "", nil // Key does not exist
+	} else if err != nil {
+		return "", err // Error occurred
 	}
+	return val, nil
+}
 
-	return ""
+func setRedisData(client *redis.Client, key string, product []Product) error {
+	jsonData, err := json.Marshal(product)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	err = client.Set(ctx, key, jsonData, time.Hour*1).Err()
+	if err != nil {
+		return err // Error occurred
+	}
+	return nil
 }
