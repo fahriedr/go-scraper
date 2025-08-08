@@ -29,6 +29,7 @@ type Response struct {
 }
 
 var tokopediaURL = "https://www.tokopedia.com/search?st=product&q="
+var shopeeURL = "https://shopee.co.id/search?keyword="
 
 var redisHost = "localhost:6379"
 var redisPassword = ""
@@ -103,9 +104,36 @@ func getProducts(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func getTestingProducts(w http.ResponseWriter, r *http.Request) {
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", false), // run with visible browser
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		chromedp.UserAgent(`Mozilla/5.0 (Windows NT 10.0; Win64; x64)
+                        AppleWebKit/537.36 (KHTML, like Gecko)
+                        Chrome/114.0.0.0 Safari/537.36`),
+	)
+
+	allocCtx, _ := chromedp.NewExecAllocator(context.Background(), opts...)
+	ctx, _ := chromedp.NewContext(allocCtx)
+
+	data, err := ShopeeScraper(w, r, ctx)
+
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+
+	fmt.Println(data)
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Add("Content-Type", "Application/json")
+	json.NewEncoder(w).Encode([]byte(`{"message": "Testing endpoint"}`))
+}
+
 func TokopediaScraper(w http.ResponseWriter, r *http.Request, ctx context.Context) ([]Product, error) {
 	source := "Tokopedia"
 	keyword := mux.Vars(r)["keyword"]
+	keyword = stringToQueryString(keyword, source)
 	url := fmt.Sprintf(tokopediaURL+"%s", keyword)
 
 	var htmlContent string
@@ -152,6 +180,32 @@ func TokopediaScraper(w http.ResponseWriter, r *http.Request, ctx context.Contex
 	return products, nil
 }
 
+func ShopeeScraper(w http.ResponseWriter, r *http.Request, ctx context.Context) ([]Product, error) {
+	source := "Shopee"
+	keyword := mux.Vars(r)["keyword"]
+	keyword = stringToQueryString(keyword, source)
+	url := fmt.Sprintf(shopeeURL+"%s", keyword)
+
+	var htmlContent string
+
+	chromedp.Run(ctx,
+		chromedp.Navigate(url),
+	)
+
+	body := strings.NewReader(htmlContent)
+
+	doc, err := goquery.NewDocumentFromReader(body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var products []Product
+
+	fmt.Println(doc.Find("shopee-search-item-result__items").First().Html())
+
+	return products, nil
+}
+
 func newRedisClient(host string, password string) *redis.Client {
 	client := redis.NewClient(&redis.Options{
 		Addr:     host,
@@ -184,4 +238,13 @@ func setRedisData(client *redis.Client, key string, product []Product) error {
 		return err // Error occurred
 	}
 	return nil
+}
+
+func stringToQueryString(s string, source string) string {
+
+	if source == "Tokopedia" {
+		return strings.ReplaceAll(s, "_", "+")
+	} else {
+		return strings.ReplaceAll(s, "_", "%20")
+	}
 }
